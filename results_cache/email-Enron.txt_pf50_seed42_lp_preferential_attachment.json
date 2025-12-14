@@ -1,0 +1,19 @@
+{
+  "num_nodes": 34318,
+  "num_edges": 182608,
+  "median_degree": 3.0,
+  "diameter": 11.0,
+  "median_path_length": 4.0,
+  "median_closeness": 0.2565354248984818,
+  "median_betweenness": 0.0,
+  "avg_clustering": 0.4317732226301745,
+  "timings": {
+    "degree": 0.03052973747253418,
+    "diameter": 0.11000514030456543,
+    "median_path_length": 18.59037208557129,
+    "median_closeness": 62.51477003097534,
+    "median_betweenness": 22.680227279663086,
+    "avg_clustering": 3.101785898208618,
+    "total": 107.92944264411926
+  }
+}

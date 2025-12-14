@@ -1,4 +1,4 @@
-import pandas as pd
+import pandas as pd  # (kept; not used below but harmless if you use it elsewhere)
 import networkx as nx
 import numpy as np
 import random
@@ -13,9 +13,10 @@ from pathlib import Path
 import json
 import time
 
-def load_enron_email_graph(path: str,min_edge_weight: int = 1,) -> nx.Graph:
+# Loading graph data
+def load_graph(path: str, min_edge_weight: int = 1) -> nx.Graph:
     """
-    Load the SNAP Enron email graph (email-Enron.txt.gz).
+    Load social graph.
 
     File format:
         Each line: u v
@@ -26,13 +27,15 @@ def load_enron_email_graph(path: str,min_edge_weight: int = 1,) -> nx.Graph:
     """
     edge_counts = Counter()
 
-    # Read compressed SNAP file
     with gzip.open(path, "rt") as f:
         for line in f:
             if line.startswith("#"):
                 continue
             u, v = line.strip().split()
-            edge_counts[(u, v)] += 1
+
+            # Canonicalize for undirected counting: (u,v) == (v,u)
+            a, b = (u, v) if u <= v else (v, u)
+            edge_counts[(a, b)] += 1
 
     G = nx.Graph()
 
@@ -47,8 +50,34 @@ def load_enron_email_graph(path: str,min_edge_weight: int = 1,) -> nx.Graph:
 
     return G
 
+# Generate random graph for stats
+def random_graph_same_size(G: nx.Graph, seed: int = 42) -> nx.Graph:
+    """
+    Create a random simple graph with the same number of nodes and edges as G.
+    Keeps the original node labels.
+    """
+    nodes = list(G.nodes())
+    n_nodes = len(nodes)
+    m_edges = G.number_of_edges()
+
+    # gnm_random_graph uses nodes 0..n_nodes-1
+    H = nx.gnm_random_graph(n_nodes, m_edges, seed=seed)
+
+    # Relabel back to original node IDs
+    mapping = {i: nodes[i] for i in range(n_nodes)}
+    H = nx.relabel_nodes(H, mapping)
+
+    # Optional: add weights to match your measure pipeline expectations
+    for u, v in H.edges():
+        H[u][v]["weight"] = 1.0
+
+    return H
+
+# Perturbation helper functions
 def remove_random_edges(G: nx.Graph, n: int, seed: int | None = None):
-    """Randomly remove n edges from G."""
+    #Randomly remove n edges from G.
+    if not isinstance(n, int):
+        raise TypeError(f"n must be int, got {type(n)}")
     if n > G.number_of_edges():
         raise ValueError("n cannot be larger than number of edges in G")
 
@@ -61,7 +90,10 @@ def remove_random_edges(G: nx.Graph, n: int, seed: int | None = None):
 
 
 def add_random_edges(G: nx.Graph, n: int, seed: int | None = None):
-    """Randomly insert n edges from the set of non-edges."""
+    #Randomly insert n edges from the set of non-edges.
+    if not isinstance(n, int):
+        raise TypeError(f"n must be int, got {type(n)}")
+
     G_new = G.copy()
     rng = random.Random(seed)
 
@@ -76,29 +108,163 @@ def add_random_edges(G: nx.Graph, n: int, seed: int | None = None):
 
 def add_predicted_edges(G: nx.Graph, predictions: list[tuple], n: int):
     """Add up to n predicted edges (u, v, score) to G (if not already present)."""
+    if not isinstance(n, int):
+        raise TypeError(f"n must be int, got {type(n)}")
+
     G_new = G.copy()
     added_edges = []
     for u, v, score in predictions:
         if len(added_edges) >= n:
             break
         if not G_new.has_edge(u, v) and u != v:
-            G_new.add_edge(u, v, weight=1.0, predicted_score=score)
+            G_new.add_edge(u, v, weight=1.0, predicted_score=float(score))
             added_edges.append((u, v))
     return G_new, added_edges
 
 
-def _score_candidates(G: nx.Graph, method: str, candidates):
+# GNN Link prediction method
+def score_candidates_gnn(G: nx.Graph, candidates, seed: int | None = None):
+    """
+    Train a small GNN (GraphSAGE) for link prediction and score `candidates`.
+    Returns list[(u, v, score)] where score is in [0,1].
+
+    Requirements:
+      pip install torch torch-geometric
+    """
+    try:
+        import torch
+        import torch.nn.functional as F
+        from torch import nn
+        from torch_geometric.data import Data
+        from torch_geometric.nn import SAGEConv
+    except ImportError as e:
+        raise ImportError(
+            "GNN method requires PyTorch + PyTorch Geometric. "
+            "Install e.g. torch and torch-geometric for your platform."
+        ) from e
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    nodes = list(G.nodes())
+    idx = {n: i for i, n in enumerate(nodes)}
+    num_nodes = len(nodes)
+
+    # Build edge_index (undirected: include both directions)
+    edges = [(idx[u], idx[v]) for u, v in G.edges() if u in idx and v in idx and u != v]
+    if not edges:
+        return [(u, v, 0.0) for (u, v) in candidates if u != v]
+
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)  # add reverse direction
+
+    # Simple node features: degree
+    deg = np.array([G.degree(n) for n in nodes], dtype=np.float32)
+    x = torch.from_numpy(deg).view(-1, 1)
+
+    data = Data(x=x, edge_index=edge_index)
+
+    class LinkPredSAGE(nn.Module):
+        def __init__(self, in_dim=1, hid=64, out=64):
+            super().__init__()
+            self.conv1 = SAGEConv(in_dim, hid)
+            self.conv2 = SAGEConv(hid, out)
+
+        def encode(self, x, edge_index):
+            h = self.conv1(x, edge_index)
+            h = F.relu(h)
+            h = self.conv2(h, edge_index)
+            return h
+
+        def score(self, z, src, dst):
+            return (z[src] * z[dst]).sum(dim=-1)  # dot product
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = LinkPredSAGE().to(device)
+    data = data.to(device)
+
+    # Positives for training
+    pos = torch.tensor(edges, dtype=torch.long, device=device)  # [E,2]
+    E = pos.size(0)
+
+    # Simple uniform negative sampling
+    seen = set((a, b) for a, b in edges) | set((b, a) for a, b in edges)
+    rng = random.Random(seed)
+
+    neg = []
+    while len(neg) < E:
+        a = rng.randrange(num_nodes)
+        b = rng.randrange(num_nodes)
+        if a == b:
+            continue
+        if (a, b) in seen:
+            continue
+        neg.append((a, b))
+        seen.add((a, b))
+        seen.add((b, a))
+    neg = torch.tensor(neg, dtype=torch.long, device=device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2, weight_decay=1e-4)
+
+    # Train
+    model.train()
+    for _ in range(50):
+        opt.zero_grad()
+        z = model.encode(data.x, data.edge_index)
+
+        pos_logits = model.score(z, pos[:, 0], pos[:, 1])
+        neg_logits = model.score(z, neg[:, 0], neg[:, 1])
+
+        logits = torch.cat([pos_logits, neg_logits], dim=0)
+        labels = torch.cat(
+            [torch.ones_like(pos_logits), torch.zeros_like(neg_logits)], dim=0
+        )
+
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        loss.backward()
+        opt.step()
+
+    # Score candidate non-edges
+    model.eval()
+    scored = []
+    with torch.no_grad():
+        z = model.encode(data.x, data.edge_index)
+        for (u, v) in candidates:
+            if u == v:
+                continue
+            if u not in idx or v not in idx:
+                continue
+            iu, iv = idx[u], idx[v]
+            logit = model.score(
+                z,
+                torch.tensor([iu], device=device),
+                torch.tensor([iv], device=device),
+            )
+            score = torch.sigmoid(logit).item()
+            scored.append((u, v, float(score)))
+
+    return scored
+
+
+# Link prediction scoring
+def _score_candidates(G: nx.Graph, method: str, candidates, *, seed: int | None = None):
     """Score candidate non-edges with a given link prediction method."""
     method = method.lower()
     if method == "jaccard":
         gen = jaccard_coefficient(G, candidates)
+        return [(u, v, score) for (u, v, score) in gen]
     elif method == "adamic_adar":
         gen = adamic_adar_index(G, candidates)
+        return [(u, v, score) for (u, v, score) in gen]
     elif method == "preferential_attachment":
         gen = preferential_attachment(G, candidates)
+        return [(u, v, score) for (u, v, score) in gen]
+    elif method == "gnn":
+        return score_candidates_gnn(G, candidates, seed=seed)
     else:
         raise ValueError(f"Unknown link prediction method: {method}")
-    return [(u, v, score) for (u, v, score) in gen]
 
 
 def predict_topn_links(
@@ -108,7 +274,12 @@ def predict_topn_links(
     candidate_sample_factor: int = 10,
     seed: int | None = None,
 ):
-    """Sample candidate non-edges, score them, and return top-n (u, v, score)."""
+    #Sample candidate non-edges, score them, and return top-n (u, v, score).
+    if not isinstance(n, int):
+        raise TypeError(f"n must be int, got {type(n)}")
+    if n <= 0:
+        return []
+
     rng = random.Random(seed)
     non_edges = list(nx.non_edges(G))
     if not non_edges:
@@ -117,7 +288,7 @@ def predict_topn_links(
     sample_size = min(len(non_edges), candidate_sample_factor * n)
     candidates = rng.sample(non_edges, sample_size)
 
-    scored = _score_candidates(G, method, candidates)
+    scored = _score_candidates(G, method, candidates, seed=seed)
     scored = [t for t in scored if t[2] is not None]
     scored.sort(key=lambda x: x[2], reverse=True)
     return scored[:n]
@@ -130,10 +301,8 @@ def perturb_with_link_prediction(
     candidate_sample_factor: int = 10,
     seed: int | None = None,
 ):
-    """
-    1) Remove n random edges.
-    2) Insert n edges chosen via `method` link prediction on the post-deletion graph.
-    """
+    # Remove n random edges.
+    # Insert n edges chosen via "method" link prediction on the post-deletion graph.
     G_removed, removed = remove_random_edges(G, n, seed=seed)
     preds = predict_topn_links(
         G_removed,
@@ -146,6 +315,7 @@ def perturb_with_link_prediction(
     return G_new, removed, added
 
 
+# Measures from Hay et al.'s paper on anonymizing social networks
 def _largest_component_subgraph(G: nx.Graph) -> nx.Graph:
     """Return the largest connected component as an undirected graph."""
     H = G.to_undirected() if G.is_directed() else G
@@ -159,22 +329,26 @@ def compute_hay_measures(G: nx.Graph) -> dict:
     """
     Compute the graph measures from 'Anonymizing Social Networks'
     on the largest connected component.
+    Returns both values and timing info.
     """
+    timings = {}
     t_total = time.time()
+
     H = _largest_component_subgraph(G)
 
-    # Degree sequence & median degree
+    # Degree
     t0 = time.time()
     degrees = np.array([d for _, d in H.degree()], dtype=float)
     median_degree = float(np.median(degrees)) if len(degrees) > 0 else float("nan")
-    t1 = time.time()
-    print(f"[Hay] Degree stats: {t1 - t0:.2f}s")
+    timings["degree"] = time.time() - t0
 
-    # Diameter (exact on GCC)
+    # Diameter (approxiomately for time saving purposes)
     t0 = time.time()
-    diameter = float(nx.diameter(H)) if H.number_of_edges() > 0 else float("nan")
-    t1 = time.time()
-    print(f"[Hay] Diameter: {t1 - t0:.2f}s")
+    try:
+        diameter = float(nx.approximation.diameter(H)) if H.number_of_edges() > 0 else float("nan")
+    except Exception:
+        diameter = float("nan")
+    timings["diameter"] = time.time() - t0
 
     # Approximate median path length
     def approximate_median_path_length(H, num_sources=500, seed=42):
@@ -184,39 +358,43 @@ def compute_hay_measures(G: nx.Graph) -> dict:
             return float("nan")
         sources = rng.sample(nodes, min(num_sources, len(nodes)))
         lengths = []
-
         for s in sources:
-            sp = nx.single_source_shortest_path_length(H, s, cutoff=None)
+            sp = nx.single_source_shortest_path_length(H, s)
             lengths.extend(v for v in sp.values() if v > 0)
-
         return float(np.median(lengths)) if lengths else float("nan")
 
     t0 = time.time()
     median_path_len = approximate_median_path_length(H)
-    t1 = time.time()
-    print(f"[Hay] Approx. median path length: {t1 - t0:.2f}s")
+    timings["median_path_length"] = time.time() - t0
 
-    # Closeness (median)
-    t0 = time.time()
-    closeness = nx.closeness_centrality(H)
-    median_closeness = float(np.median(list(closeness.values()))) if closeness else float("nan")
-    t1 = time.time()
-    print(f"[Hay] Closeness centrality: {t1 - t0:.2f}s")
+    # Approximate median closeness
+    def approximate_median_closeness(H, num_nodes=2000, seed=42):
+        rng = random.Random(seed)
+        nodes = list(H.nodes())
+        if not nodes:
+            return float("nan")
+        sample = rng.sample(nodes, min(num_nodes, len(nodes)))
+        vals = [nx.closeness_centrality(H, u) for u in sample]
+        return float(np.median(vals)) if vals else float("nan")
 
-    # Betweenness (median) – approximate via k=500 sampled nodes
     t0 = time.time()
-    betweenness = nx.betweenness_centrality(H, k=min(500, H.number_of_nodes()), normalized=True, seed=42)
+    median_closeness = approximate_median_closeness(H)
+    timings["median_closeness"] = time.time() - t0
+
+    # Approximate betweenness
+    t0 = time.time()
+    betweenness = nx.betweenness_centrality(
+        H, k=min(200, H.number_of_nodes()), normalized=True, seed=42
+    )
     median_betweenness = float(np.median(list(betweenness.values()))) if betweenness else float("nan")
-    t1 = time.time()
-    print(f"[Hay] Approx. betweenness (k=500): {t1 - t0:.2f}s")
+    timings["median_betweenness"] = time.time() - t0
 
-    # Average clustering coefficient
+    # Clustering
     t0 = time.time()
     avg_clustering = float(nx.average_clustering(H)) if H.number_of_nodes() > 0 else float("nan")
-    t1 = time.time()
-    print(f"[Hay] Avg clustering: {t1 - t0:.2f}s")
+    timings["avg_clustering"] = time.time() - t0
 
-    print(f"[Hay] TOTAL: {time.time() - t_total:.2f}s\n")
+    timings["total"] = time.time() - t_total
 
     return {
         "num_nodes": H.number_of_nodes(),
@@ -227,10 +405,10 @@ def compute_hay_measures(G: nx.Graph) -> dict:
         "median_closeness": median_closeness,
         "median_betweenness": median_betweenness,
         "avg_clustering": avg_clustering,
+        "timings": timings,
     }
 
-
-
+# Print the measures comparison, between original, 5% and random graph
 def print_measure_comparison(
     measures_original: dict,
     measures_perturbed: dict,
@@ -263,6 +441,7 @@ def print_measure_comparison(
         print("\t".join(row))
 
 
+# Caching to save on compute time
 def _cache_filename(
     cache_dir: Path,
     csv_path: str,
@@ -284,58 +463,69 @@ def _load_or_compute_measures(
     tag: str,
     compute_fn,
 ) -> dict:
-    """
-    If cached JSON exists, load and return it.
-    Otherwise, call compute_fn(), cache result, and return it.
-    """
-    cache_dir.mkdir(exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     path = _cache_filename(cache_dir, csv_path, perturb_fraction, seed, tag)
 
     if path.exists():
         with open(path, "r") as f:
             return json.load(f)
 
+    print(f"[CACHE MISS] Computing {tag}...")
     measures = compute_fn()
-    with open(path, "w") as f:
-        json.dump(measures, f)
+
+    # atomic-ish write
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(measures, f, indent=2)
+    tmp.replace(path)
+
+    print(f"[CACHE WRITE] {path}")
     return measures
 
 
+
+# Run experiment, all different perturbation methods, compared to original and random graph,
+# with the Hay measures from the original paper
 def run_experiment(
     csv_path: str,
     perturb_fraction: float = 0.05,
-    # keep only methods actually implemented in _score_candidates:
-    link_methods=("jaccard", "adamic_adar", "preferential_attachment"),
+    link_methods=("jaccard", "adamic_adar", "preferential_attachment", "gnn"),
     seed: int = 42,
 ):
     cache_dir = Path("results_cache")
 
-    # Load original Enron graph
-    G_original = load_enron_email_graph(csv_path)
+    # Load graph (replace with file name)
+    G_original = load_graph(csv_path)
     E = G_original.number_of_edges()
     n = int(round(perturb_fraction * E))
     print(f"Original: {G_original.number_of_nodes()} nodes, {E} edges")
     print(f"Perturbation: delete {n}, add {n} edges ({perturb_fraction*100:.1f}% of edges)\n")
 
-    # Original measures (no caching needed; fast-ish compared to perturbations)
-    measures_orig = compute_hay_measures(G_original)
+    # Original measures
+    measures_orig = _load_or_compute_measures(
+        cache_dir,
+        csv_path,
+        perturb_fraction=0.0,  # important: separate cache key
+        seed=seed,
+        tag="original",
+        compute_fn=lambda: compute_hay_measures(G_original),
+    )
 
-    # Random 100% perturbation baseline (tag: "random_full")
+    # Random 100% perturbation baseline: random graph with same (n, m)
+    def _compute_random_full():
+        G_full = random_graph_same_size(G_original, seed=seed)
+        return compute_hay_measures(G_full)
+
     measures_rand_full = _load_or_compute_measures(
         cache_dir,
         csv_path,
-        perturb_fraction,  # harmless even though full random ignores it
+        perturb_fraction,  # fine to keep; tag makes it distinct anyway
         seed,
         tag="random_full",
-        compute_fn=lambda: compute_hay_measures(
-            add_random_edges(
-                *remove_random_edges(G_original, E, seed=seed),
-                seed=seed
-            )[0]
-        ),
+        compute_fn=_compute_random_full,
     )
 
-    # Random partial perturbation baseline (tag: "random_partial")
+    # Random partial perturbation baseline
     def _compute_random_partial():
         G_random, _ = remove_random_edges(G_original, n, seed=seed)
         G_random, _ = add_random_edges(G_random, n, seed=seed)
@@ -365,11 +555,11 @@ def run_experiment(
         tag = f"lp_{m}"
         print(f"=== Link-prediction perturbation: {m} ===")
 
-        def _compute_lp():
+        def _compute_lp(method=m):
             G_lp, _, _ = perturb_with_link_prediction(
                 G_original,
                 n=n,
-                method=m,
+                method=method,
                 candidate_sample_factor=10,
                 seed=seed,
             )
@@ -392,8 +582,6 @@ def run_experiment(
             label_random="Random 100%",
         )
         print()
-
-
 
 
 if __name__ == "__main__":
